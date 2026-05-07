@@ -1,0 +1,436 @@
+"""
+跨境电商合规与选品 Multi-Agent 系统
+基于 LangGraph 构建，单文件可运行
+运行方式：python cross_border_agent.py
+依赖：pip install langgraph langchain langchain-openai openai pydantic python-dotenv fastapi uvicorn
+"""
+
+import asyncio
+import random
+from typing import Any, Dict, List, Optional
+from enum import Enum
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+import uvicorn
+
+from langgraph.graph import StateGraph, END
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage
+
+# ============================================================
+# 1. 数据模型与常量
+# ============================================================
+
+class TargetMarket(str, Enum):
+    USA = "USA"
+    EU = "EU"
+    JAPAN = "JAPAN"
+
+# 不同市场对产品类别的合规要求映射
+MARKET_COMPLIANCE_MAP: Dict[str, Dict[str, List[str]]] = {
+    "USA": {
+        "电子产品": ["FCC", "UL"],
+        "食品": ["FDA"],
+        "儿童用品": ["CPC", "FDA"],
+        "医疗器械": ["FDA"],
+        "化妆品": ["FDA"],
+        "纺织品": [],
+        "家居用品": [],
+        "运动户外": [],
+        "宠物用品": [],
+    },
+    "EU": {
+        "电子产品": ["CE", "RoHS", "WEEE"],
+        "食品": ["CE"],
+        "儿童用品": ["CE", "REACH"],
+        "医疗器械": ["CE", "RoHS"],
+        "化妆品": ["CE", "REACH"],
+        "纺织品": ["REACH"],
+        "家居用品": ["CE"],
+        "运动户外": ["CE"],
+        "宠物用品": ["CE"],
+    },
+    "JAPAN": {
+        "电子产品": ["PSE", "TELEC"],
+        "食品": ["SG"],
+        "儿童用品": ["SG"],
+        "医疗器械": ["PSE"],
+        "化妆品": ["SG"],
+        "纺织品": [],
+        "家居用品": ["SG"],
+        "运动户外": ["SG"],
+        "宠物用品": ["SG"],
+    },
+}
+
+class ProductInfo(BaseModel):
+    name: str = Field(description="产品名称")
+    category: str = Field(description="产品品类")
+    target_price_cny: float = Field(description="中国采购成本(CNY)")
+    target_price_usd: float = Field(description="目标售价(USD)")
+    weight_kg: float = Field(description="产品重量(KG)")
+    dimensions_cm: Optional[str] = Field(default=None, description="产品尺寸")
+    description: Optional[str] = Field(default=None, description="产品描述")
+
+class MarketData(BaseModel):
+    search_volume_monthly: int = Field(description="月搜索量")
+    competition_level: str = Field(description="竞争度: 低/中/高")
+    avg_selling_price_usd: float = Field(description="市场均价(USD)")
+    bsr_rank: Optional[int] = Field(default=None, description="BSR排名")
+    review_count_avg: int = Field(default=0, description="平均评论数")
+    trend_direction: str = Field(default="stable", description="趋势: rising/stable/declining")
+
+class ComplianceResult(BaseModel):
+    required_certifications: List[str] = Field(description="必需认证")
+    tariff_rate: float = Field(description="关税税率(%)")
+    estimated_tariff_cny: float = Field(description="预估关税成本(CNY)")
+    ip_risk_level: str = Field(description="知识产权风险: 低/中/高")
+    restricted_keywords: List[str] = Field(default_factory=list, description="受限关键词")
+    compliance_score: float = Field(description="合规评分(0-100)")
+    warnings: List[str] = Field(default_factory=list, description="风险警告")
+
+class ProductScore(BaseModel):
+    product_name: str = Field(description="产品名称")
+    market_score: float = Field(description="市场潜力分(0-100)")
+    profit_score: float = Field(description="利润分(0-100)")
+    competition_score: float = Field(description="竞争分(0-100,越高越容易进入)")
+    compliance_score: float = Field(description="合规分(0-100)")
+    overall_score: float = Field(description="综合评分(0-100)")
+    recommendation: str = Field(description="推荐结论")
+    detailed_report: str = Field(description="详细分析报告")
+
+class AgentState(BaseModel):
+    messages: List[Dict[str, str]] = Field(default_factory=list)
+    product_keyword: str = Field(default="")
+    target_market: TargetMarket = Field(default=TargetMarket.USA)
+    product_info: Optional[ProductInfo] = Field(default=None)
+    market_data: Optional[MarketData] = Field(default=None)
+    compliance_result: Optional[ComplianceResult] = Field(default=None)
+    product_score: Optional[ProductScore] = Field(default=None)
+    next_step: str = Field(default="start")
+    error: Optional[str] = Field(default=None)
+
+# ============================================================
+# 2. 模拟工具函数
+# ============================================================
+
+def mock_search_market_data(product_keyword: str, target_market: TargetMarket) -> MarketData:
+    """模拟获取市场数据"""
+    seed_val = sum(ord(c) for c in product_keyword) % 100
+    random.seed(seed_val)
+    search_volume = 5000 + seed_val * 200
+    competition_options = ["低", "中", "高"]
+    competition = competition_options[seed_val % 3]
+    avg_price = 15.0 + seed_val * 0.8
+    bsr = 1000 + seed_val * 50
+    return MarketData(
+        search_volume_monthly=search_volume,
+        competition_level=competition,
+        avg_selling_price_usd=round(avg_price, 2),
+        bsr_rank=bsr,
+        review_count_avg=random.randint(100, 2000),
+        trend_direction=random.choice(["rising", "stable", "declining"]),
+    )
+
+def check_compliance(product_category: str, target_market: TargetMarket) -> ComplianceResult:
+    """根据品类和目的国返回合规要求"""
+    certs = MARKET_COMPLIANCE_MAP.get(target_market.value, {}).get(product_category, [])
+    seed_val = sum(ord(c) for c in product_category + target_market.value) % 100
+    random.seed(seed_val)
+    if target_market == TargetMarket.USA:
+        tariff = 5.0 + seed_val * 0.20
+    elif target_market == TargetMarket.EU:
+        tariff = 3.0 + seed_val * 0.17
+    else:
+        tariff = 2.0 + seed_val * 0.13
+    tariff = round(tariff, 1)
+    score = 100.0 - len(certs) * 8.0 - tariff * 0.8
+    score = max(10.0, min(100.0, round(score, 1)))
+    ip_risk = "低" if len(certs) < 2 else ("中" if len(certs) < 4 else "高")
+    warnings = []
+    if not certs:
+        warnings.append("该品类暂无明显认证门槛，但仍需关注目的国最新法规动态")
+    if tariff > 15:
+        warnings.append(f"关税较高({tariff}%)，建议优化HS编码归类或考虑第三方海外仓中转")
+    if product_category == "电子产品" and target_market == TargetMarket.USA:
+        warnings.append("电子产品进入美国市场需特别注意FCC认证及专利排查")
+    return ComplianceResult(
+        required_certifications=certs,
+        tariff_rate=tariff,
+        estimated_tariff_cny=round(tariff / 100 * 100, 2),
+        ip_risk_level=ip_risk,
+        restricted_keywords=[],
+        compliance_score=score,
+        warnings=warnings,
+    )
+
+def translate_for_market(text: str, target_market: TargetMarket) -> str:
+    translations = {
+        TargetMarket.USA: text,
+        TargetMarket.EU: text + " (EN/EU localized)",
+        TargetMarket.JAPAN: text + " (日本語版)",
+    }
+    return translations.get(target_market, text)
+
+def search_keyword_suggestions(keyword: str) -> list:
+    suffixes = ["pro", "premium", "mini", "portable", "wireless", "smart"]
+    return [f"{keyword} {s}" for s in suffixes]
+
+# ============================================================
+# 3. Agent 节点（选品分析、合规检查、报告生成）
+# ============================================================
+
+SYSTEM_PROMPT_RESEARCH = """你是一名跨境电商选品分析专家。你需要分析用户输入的产品关键词和目标市场，
+给出详细的市场分析报告。你的分析应包含：
+1. 市场容量评估（搜索量、需求趋势）
+2. 竞争格局分析（竞品数量、评论情况、BSR排名）
+3. 利润空间测算（采购成本 vs 市场售价 vs 平台佣金 vs 物流成本）
+4. 差异化机会建议
+
+请用中文输出结构化的分析结果，每个维度给出具体数据后再下结论。"""
+
+async def product_research_node(state: AgentState) -> Dict[str, Any]:
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.3)
+    market_data = mock_search_market_data(state.product_keyword, state.target_market)
+    keyword_suggestions = search_keyword_suggestions(state.product_keyword)
+
+    market_info = f"""
+    目标市场: {state.target_market.value}
+    产品关键词: {state.product_keyword}
+    月搜索量: {market_data.search_volume_monthly}
+    竞争程度: {market_data.competition_level}
+    市场均价: ${market_data.avg_selling_price_usd}
+    BSR排名: {market_data.bsr_rank}
+    平均评论数: {market_data.review_count_avg}
+    市场趋势: {market_data.trend_direction}
+    建议长尾关键词: {keyword_suggestions}
+    """
+    response = await llm.ainvoke([
+        SystemMessage(content=SYSTEM_PROMPT_RESEARCH),
+        HumanMessage(content=f"请分析以下产品的市场潜力：\n{market_info}")
+    ])
+
+    product_category = "电子产品" if "电子" in state.product_keyword else "家居用品"
+    product_info = ProductInfo(
+        name=f"{state.product_keyword} {state.target_market.value}版",
+        category=product_category,
+        target_price_cny=50.0,
+        target_price_usd=market_data.avg_selling_price_usd * 0.7,
+        weight_kg=0.5,
+        description=response.content[:200],
+    )
+    return {
+        "market_data": market_data,
+        "product_info": product_info,
+        "messages": [{"role": "assistant", "content": response.content}],
+        "next_step": "compliance_check",
+    }
+
+SYSTEM_PROMPT_COMPLIANCE = """你是一名跨境电商合规顾问，精通美国、欧盟、日本的进口法规。
+你需要基于目标市场和产品品类，给出详细的合规分析报告。你的分析应包含：
+1. 必需的产品认证清单（CE/FDA/FCC/PSE等）及获取难度
+2. 关税成本估算及优化建议（HS编码归类、原产地规则利用）
+3. 知识产权风险预警（专利、商标、外观设计）
+4. 标签与包装要求（语言、安全标识、环保标识）
+5. 整体合规风险评级及改进建议
+
+请用中文输出，每个风险点务必给出可操作的解决方案。"""
+
+async def compliance_check_node(state: AgentState) -> Dict[str, Any]:
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.2)
+    product_category = state.product_info.category if state.product_info else "家居用品"
+    compliance_result = check_compliance(product_category, state.target_market)
+    localized_desc = translate_for_market(
+        state.product_info.description or "", state.target_market
+    )
+
+    compliance_info = f"""
+    产品品类: {product_category}
+    目标市场: {state.target_market.value}
+    必需认证: {compliance_result.required_certifications}
+    关税税率: {compliance_result.tariff_rate}%
+    知识产权风险等级: {compliance_result.ip_risk_level}
+    风险警告: {compliance_result.warnings}
+    合规评分: {compliance_result.compliance_score}/100
+    本地化描述: {localized_desc}
+    """
+    response = await llm.ainvoke([
+        SystemMessage(content=SYSTEM_PROMPT_COMPLIANCE),
+        HumanMessage(content=f"请分析以下产品的合规情况：\n{compliance_info}")
+    ])
+
+    updated_compliance = ComplianceResult(
+        required_certifications=compliance_result.required_certifications,
+        tariff_rate=compliance_result.tariff_rate,
+        estimated_tariff_cny=compliance_result.estimated_tariff_cny,
+        ip_risk_level=compliance_result.ip_risk_level,
+        restricted_keywords=compliance_result.restricted_keywords,
+        compliance_score=compliance_result.compliance_score,
+        warnings=compliance_result.warnings + [response.content[:200]],
+    )
+    return {
+        "compliance_result": updated_compliance,
+        "messages": [{"role": "assistant", "content": response.content}],
+        "next_step": "generate_report",
+    }
+
+SYSTEM_PROMPT_REPORT = """你是一名跨境电商运营总监，需要基于选品分析和合规检查的结果，
+生成一份综合评估报告。报告应包含以下部分：
+1. 综合评分（市场潜力、利润率、竞争度、合规风险 四个维度加权评分）
+2. 推荐结论（强烈推荐/谨慎推荐/不推荐）
+3. 行动建议（下一步具体操作，如：提交哪些认证、优化哪些关键词、定价策略等）
+4. 风险提示与缓解方案
+
+评分逻辑：
+- 市场需求30%（搜索量、趋势）
+- 利润空间25%（售价-成本-佣金-物流-关税）
+- 竞争格局20%（竞品数量、差异化空间）
+- 合规风险25%（认证难度、关税壁垒）
+
+输出格式要求：先给出总分和判定，再逐维度展开。"""
+
+async def report_generator_node(state: AgentState) -> Dict[str, Any]:
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.3)
+
+    context = f"""
+    【选品分析结果】
+    产品: {state.product_info.name if state.product_info else 'N/A'}
+    品类: {state.product_info.category if state.product_info else 'N/A'}
+    市场数据: {state.market_data.model_dump_json() if state.market_data else 'N/A'}
+
+    【合规检查结果】
+    目标市场: {state.target_market.value}
+    必需认证: {state.compliance_result.required_certifications if state.compliance_result else 'N/A'}
+    关税税率: {state.compliance_result.tariff_rate if state.compliance_result else 'N/A'}%
+    合规评分: {state.compliance_result.compliance_score if state.compliance_result else 'N/A'}/100
+    风险警告: {state.compliance_result.warnings if state.compliance_result else 'N/A'}
+    """
+    response = await llm.ainvoke([
+        SystemMessage(content=SYSTEM_PROMPT_REPORT),
+        HumanMessage(content=f"请生成综合评估报告：\n{context}")
+    ])
+
+    market_score = 70.0
+    compliance_score = state.compliance_result.compliance_score if state.compliance_result else 50.0
+    overall = round(
+        market_score * 0.30 +
+        (60.0 * 0.25) +
+        (65.0 * 0.20) +
+        compliance_score * 0.25,
+        1
+    )
+    recommendation = "强烈推荐" if overall >= 75 else ("谨慎推荐" if overall >= 50 else "不推荐")
+
+    product_score = ProductScore(
+        product_name=state.product_info.name if state.product_info else state.product_keyword,
+        market_score=market_score,
+        profit_score=60.0,
+        competition_score=65.0,
+        compliance_score=compliance_score,
+        overall_score=overall,
+        recommendation=recommendation,
+        detailed_report=response.content,
+    )
+    return {
+        "product_score": product_score,
+        "messages": [{"role": "assistant", "content": response.content}],
+        "next_step": "end",
+    }
+
+# ============================================================
+# 4. LangGraph 工作流构建
+# ============================================================
+
+def build_cross_border_agent_graph():
+    workflow = StateGraph(AgentState)
+    workflow.add_node("product_research", product_research_node)
+    workflow.add_node("compliance_check", compliance_check_node)
+    workflow.add_node("generate_report", report_generator_node)
+    workflow.set_entry_point("product_research")
+    workflow.add_edge("product_research", "compliance_check")
+    workflow.add_edge("compliance_check", "generate_report")
+    workflow.add_edge("generate_report", END)
+    return workflow.compile()
+
+cross_border_agent = build_cross_border_agent_graph()
+
+# ============================================================
+# 5. FastAPI 服务
+# ============================================================
+
+app = FastAPI(
+    title="跨境电商合规与选品 Agent API",
+    description="基于 LangGraph 构建的多智能体选品与合规分析系统",
+    version="1.0.0",
+)
+
+class AnalyzeRequest(BaseModel):
+    product_keyword: str = Field(
+        description="产品关键词",
+        examples=["bluetooth speaker", "yoga mat", "led desk lamp"]
+    )
+    target_market: str = Field(
+        default="USA",
+        description="目标市场",
+        examples=["USA", "EU", "JAPAN"]
+    )
+
+class AnalyzeResponse(BaseModel):
+    product_name: str
+    target_market: str
+    overall_score: float
+    market_score: float
+    profit_score: float
+    competition_score: float
+    compliance_score: float
+    recommendation: str
+    detailed_report: str
+    required_certifications: list
+    tariff_rate: float
+    warnings: list
+    workflow_steps: list
+
+async def run_agent_workflow(product_keyword: str, target_market: str) -> AgentState:
+    initial_state = AgentState(
+        product_keyword=product_keyword,
+        target_market=TargetMarket(target_market),
+        next_step="start",
+    )
+    final_state = await cross_border_agent.ainvoke(initial_state)
+    return final_state
+
+@app.post("/analyze", response_model=AnalyzeResponse)
+async def analyze_product(request: AnalyzeRequest):
+    if request.target_market not in [m.value for m in TargetMarket]:
+        raise HTTPException(status_code=400, detail=f"不支持的目标市场，可选：{[m.value for m in TargetMarket]}")
+    try:
+        state = await run_agent_workflow(request.product_keyword, request.target_market)
+        score = state.product_score
+        compliance = state.compliance_result
+        if not score:
+            raise HTTPException(status_code=500, detail="分析流程异常")
+        return AnalyzeResponse(
+            product_name=score.product_name,
+            target_market=request.target_market,
+            overall_score=score.overall_score,
+            market_score=score.market_score,
+            profit_score=score.profit_score,
+            competition_score=score.competition_score,
+            compliance_score=score.compliance_score,
+            recommendation=score.recommendation,
+            detailed_report=score.detailed_report,
+            required_certifications=compliance.required_certifications if compliance else [],
+            tariff_rate=compliance.tariff_rate if compliance else 0.0,
+            warnings=compliance.warnings if compliance else [],
+            workflow_steps=["选品市场分析", "合规认证检查", "关税成本计算", "综合评分报告"],
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"分析失败: {str(e)}")
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "agent": "跨境电商合规与选品 Agent"}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
